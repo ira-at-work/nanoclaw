@@ -13,7 +13,7 @@ description: Install PAWS (paws4claws) as an AWS credential proxy for agent cont
 ## How it works
 
 ```
-agent container ──aws cmd──► wrapper (/usr/local/bin/aws)
+agent container ──aws cmd──► wrapper (~/bin/aws, or mounted path — see §6)
                                   │  HTTP POST /invoke  (PAWS_TOKEN auth)
                              paws daemon (holds ~/.aws creds)
                                   │
@@ -94,75 +94,177 @@ docker logs paws
 # paws: listening on 0.0.0.0:7142
 ```
 
-## 6. Nanoclaw code changes (already applied in this branch)
+## 6. Choose a wrapper install mode
 
-These changes are checked into `ester2` — no manual edits needed for a fresh checkout. Documented here for reference.
+The PAWS wrapper is **two files** from the paws4claws repo (`wrapper/aws` and `wrapper/file_allowlist.sh`). Pick **one** mode below.
 
-### `container/Dockerfile`
+| Mode                | Where files live                             | Rebuild image?      | Upgrade wrapper                              |
+| ------------------- | -------------------------------------------- | ------------------- | -------------------------------------------- |
+| **C (recommended)** | Host `~/bin`, mounted R/W into the container | No                  | Copy two files on host; no container restart |
+| **B**               | Host dir, bind-mounted read-only at spawn    | No (respawn agents) | Replace host files; new containers pick up   |
+| **A**               | Baked into the agent image (`COPY`)          | Yes                 | Sync into `container/`, rebuild image        |
 
-- Removed `awscli` from the apt-get install list
-- Added `jq` (required by the wrapper to build JSON payloads)
-- Removed `ln -s /usr/bin/aws /usr/local/bin/aws`
+The wrapper finds `file_allowlist.sh` next to the `aws` script (`dirname "$0"`), or at `/usr/local/lib/paws/file_allowlist.sh` (mode A layout).
 
-> **Do NOT bake the wrapper into the image via `COPY`.** Mount it from outside instead (see step 6b below). This keeps the wrapper updatable without an image rebuild.
+Set `PAWS_REPO=~/paws` (or your clone path) for the commands below.
 
-### 6b. Mount the wrapper per agent group
+### Mode C — Host `~/bin` (recommended)
 
-Place the two wrapper files from `paws4claws/wrapper/` into the agent group's `bin/` directory:
+**Best for:** simplest install and fastest upgrades. Nanoclaw typically mounts the agent homedir from the host; `~/bin` inside the container is a host directory you can edit without rebuilding or restarting.
+
+1. Ensure the agent image has **`curl`** and **`jq`** (no `awscli`, no wrapper `COPY`).
+1. Copy both wrapper files into the agent's **host** `bin` directory (same folder — the path that appears as `~/bin` inside the container):
 
 ```bash
-cp ~/paws/wrapper/aws ~/paws/wrapper/file_allowlist.sh groups/<group>/bin/
-chmod 755 groups/<group>/bin/aws groups/<group>/bin/file_allowlist.sh
+AGENT_BIN=~/nanoclaw/data/agents/main/bin   # adjust to your homedir layout
+mkdir -p "$AGENT_BIN"
+cp "$PAWS_REPO/wrapper/aws" "$PAWS_REPO/wrapper/file_allowlist.sh" "$AGENT_BIN/"
+chmod +x "$AGENT_BIN/aws"
 ```
 
-The group `bin/` directory is mounted at `/workspace/agent/bin/` inside the container. The `aws` wrapper looks for `file_allowlist.sh` alongside itself, so both files must be in the same directory. Agents call the wrapper as `/workspace/agent/bin/aws` or via whatever PATH additions are in the group's CLAUDE.md.
+1. Confirm `~/bin` is on `PATH` inside the container (nanoclaw default for many setups).
+
+No `container-runner` volume mounts or Dockerfile `COPY` lines are required for the wrapper.
+
+### Mode B — Runtime read-only bind mount
+
+**Best for:** one canonical wrapper directory on the host, shared across agents, without baking into the image.
+
+1. Install files on the host (both in the same directory):
+
+```bash
+mkdir -p ~/paws/wrapper
+cp "$PAWS_REPO/wrapper/aws" "$PAWS_REPO/wrapper/file_allowlist.sh" ~/paws/wrapper/
+chmod +x ~/paws/wrapper/aws
+```
+
+1. In **`src/container-runner.ts`**, when `PAWS_TOKEN` is set, add bind mounts to each `docker run` (paths must match inside the container):
+
+```typescript
+// Option 1 — standard layout (matches mode A paths):
+'-v', `${process.env.HOME}/paws/wrapper/aws:/usr/local/bin/aws:ro`,
+'-v', `${process.env.HOME}/paws/wrapper/file_allowlist.sh:/usr/local/lib/paws/file_allowlist.sh:ro`,
+
+// Option 2 — single directory + PATH (both files colocated):
+'-v', `${process.env.HOME}/paws/wrapper:/opt/paws:ro`,
+// and inject: -e PATH=/opt/paws:${existingPath}
+```
+
+1. Recompile host TS (`pnpm run build`). **Respawn** agent containers after upgrading wrapper files on the host (no full image rebuild).
+
+### Mode A — Bake into the agent image (Dockerfile)
+
+**Best for:** operators who want the wrapper fixed inside the image. **Slowest** install and upgrade (rebuild + restart every time).
+
+1. Sync from paws4claws into nanoclaw `container/`:
+
+```bash
+cp "$PAWS_REPO/wrapper/aws" "$PAWS_REPO/wrapper/file_allowlist.sh" ~/nanoclaw/container/
+```
+
+1. In **`container/Dockerfile`** (ester2 branch may already have this):
+
+```dockerfile
+RUN apt-get install -y --no-install-recommends jq curl   # no awscli
+COPY --chmod=755 file_allowlist.sh /usr/local/lib/paws/file_allowlist.sh
+COPY --chmod=755 aws /usr/local/bin/aws
+```
+
+1. Rebuild the agent image (see §8).
+
+## 7. Nanoclaw changes (all modes)
+
+These apply regardless of wrapper install mode. On the `ester2` branch many are already applied.
 
 ### `src/container-runner.ts`
 
 - Removed the `~/.aws` host mount block
-- Added: read `PAWS_TOKEN` from `.env`; if set, add `--network paws-net` and `-e PAWS_TOKEN=…` to the `docker run` args
-- Added `paws` to `NO_PROXY` / `no_proxy` alongside `.amazonaws.com` — critical: the OneCLI gateway sets `HTTP_PROXY` which would otherwise intercept plain-HTTP calls to `http://paws:7142`
+- When `PAWS_TOKEN` is set in `~/nanoclaw/.env`: add `--network paws-net` and `-e PAWS_TOKEN=…` to agent `docker run`
+- Add **`paws`** to `NO_PROXY` / `no_proxy` alongside `.amazonaws.com` — the OneCLI gateway sets `HTTP_PROXY`, which otherwise intercepts `http://paws:7142`
 
-## 7. Rebuild and restart
+### Mode-specific extras
 
-After changing the Dockerfile or container-runner, rebuild the agent image and restart:
+| Mode | Dockerfile wrapper `COPY` | container-runner bind mounts |
+| ---- | ------------------------- | ---------------------------- |
+| C    | None                      | None                         |
+| B    | None                      | Yes (§6 mode B)              |
+| A    | Yes (§6 mode A)           | Optional                     |
+
+## 8. Rebuild and restart
+
+| Mode  | When you need a rebuild / restart                                                                               |
+| ----- | --------------------------------------------------------------------------------------------------------------- |
+| **C** | Only when changing agent image deps (`jq`, `curl`) or `container-runner.ts` — **not** for wrapper-only upgrades |
+| **B** | After `container-runner.ts` mount changes: `pnpm run build` + respawn agents                                    |
+| **A** | After any Dockerfile or wrapper change: `cd container && ./build.sh` + restart nanoclaw                         |
 
 ```bash
-pnpm run build            # compile host TS
-cd container && ./build.sh && cd ..
+pnpm run build            # compile host TS (modes B, A, or runner changes)
+cd container && ./build.sh && cd ..   # mode A only (image rebuild)
 systemctl --user restart "$(. setup/lib/install-slug.sh && systemd_unit)"
 ```
 
-## 8. Verify
+## 9. Verify
+
+Use the same **PATH and volume mounts** as production. Replace `nanoclaw-agent-v2-58d885a2:latest` with your image tag.
+
+**Version check** (no `PAWS_TOKEN`, no AWS call):
 
 ```bash
-# Quick smoke test — run a throwaway container on paws-net:
+docker run --rm \
+  --network paws-net \
+  -e "NO_PROXY=paws,.amazonaws.com,169.254.169.254" \
+  -e "no_proxy=paws,.amazonaws.com,169.254.169.254" \
+  nanoclaw-agent-v2-58d885a2:latest \
+  aws --paws-version
+# Expected (versions aligned after upgrade):
+#   wrapper: 0.4.0
+#   daemon:  0.4.0
+# Exit 1 + stderr if wrapper and daemon differ (version drift).
+```
+
+For **mode B**, add the same `-v` / `-e PATH=…` flags you use in `container-runner.ts`. For **mode C**, run verify from a **running** agent container (host `~/bin` is mounted there):
+
+```bash
+docker exec <container-name> aws --paws-version
+```
+
+**Smoke test** (`PAWS_TOKEN` required):
+
+```bash
 source <(grep '^PAWS_TOKEN=' ~/nanoclaw/.env | tail -1)
 docker run --rm \
-  --entrypoint bash \
   --network paws-net \
   -e "PAWS_TOKEN=$PAWS_TOKEN" \
   -e "NO_PROXY=paws,.amazonaws.com,169.254.169.254" \
   -e "no_proxy=paws,.amazonaws.com,169.254.169.254" \
   nanoclaw-agent-v2-58d885a2:latest \
-  -c 'aws sts get-caller-identity'
-# Expected: {"UserId": "...", "Account": "...", "Arn": "..."}
+  aws sts get-caller-identity
 ```
 
-Or from inside a running agent container (after the agent spawns on a message):
+Or from a running agent: `docker exec <container-name> aws sts get-caller-identity`
 
-```bash
-docker exec <container-name> bash -c 'aws sts get-caller-identity'
-```
+## 10. Upgrading PAWS
+
+After pulling a new paws4claws release, bump **both** `PAWS_WRAPPER_VERSION` in `wrapper/aws` and `VERSION` in `daemon/paws.py`, rebuild/restart the **daemon** image, then upgrade the wrapper per mode:
+
+| Mode  | Wrapper upgrade steps                                                                         |
+| ----- | --------------------------------------------------------------------------------------------- |
+| **C** | `cp` `wrapper/aws` and `wrapper/file_allowlist.sh` to host `~/bin` — **no container restart** |
+| **B** | `cp` both files to `~/paws/wrapper/` — respawn agent containers                               |
+| **A** | `cp` into `container/`, rebuild agent image, restart nanoclaw                                 |
+
+Run `aws --paws-version` after upgrading to confirm wrapper and daemon match.
 
 ## File I/O limitations
 
-| Blocked / not yet              | Use instead                                       |
-| ------------------------------ | ------------------------------------------------- |
-| `aws s3 cp s3://… /local/path` | `aws s3 cp s3://… - > /local/path` (v0.4 planned) |
-| `aws s3 cp /local/path s3://…` | `aws s3 cp ./local s3://…` (v0.3) or pipe to `-`  |
-| `aws s3 sync ./local s3://…`   | not available (v0.5 planned)                      |
-| `aws s3 cp s3://src s3://dst`  | ✅ server-side copy                               |
+| Blocked / not yet              | Use instead                                      |
+| ------------------------------ | ------------------------------------------------ |
+| `aws s3 cp s3://… /local/path` | supported via v0.4 `outputFiles`                 |
+| `aws s3 cp --recursive …`      | not supported (v0.5)                             |
+| `aws s3 cp /local/path s3://…` | `aws s3 cp ./local s3://…` (v0.3) or pipe to `-` |
+| `aws s3 sync ./local s3://…`   | not available (v0.5 planned)                     |
+| `aws s3 cp s3://src s3://dst`  | server-side copy                                 |
 
 ## Troubleshooting
 
@@ -183,12 +285,15 @@ The `PAWS_TOKEN` in the agent container doesn't match any `PAWS_TOKEN_*` in the 
 
 ### `aws` command not found
 
-The wrapper files aren't in the group `bin/` directory. Copy them from `~/paws/wrapper/`:
+| Mode  | Check                                                                                                            |
+| ----- | ---------------------------------------------------------------------------------------------------------------- |
+| **C** | Both files on the **host** `bin` path that mounts as `~/bin`; `which aws` inside the container shows `~/bin/aws` |
+| **B** | Bind mounts present on `docker inspect <container>`; host files exist under `~/paws/wrapper/`                    |
+| **A** | `container/aws` synced from paws4claws; Dockerfile `COPY` lines present; image rebuilt                           |
 
-```bash
-cp ~/paws/wrapper/aws ~/paws/wrapper/file_allowlist.sh groups/<group>/bin/
-chmod 755 groups/<group>/bin/aws groups/<group>/bin/file_allowlist.sh
-```
+### `paws: file_allowlist.sh not found`
+
+The wrapper could not find its allowlist. **Mode C / B (colocated):** `file_allowlist.sh` must sit in the **same directory** as the `aws` script. **Mode A:** confirm `/usr/local/lib/paws/file_allowlist.sh` exists in the image.
 
 ### Daemon not persisting across reboots
 
