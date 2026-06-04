@@ -266,12 +266,30 @@ Otherwise, run `/init-first-agent` to create an agent and wire it to your Signal
 
 - Markdown formatting — `**bold**`, `*italic*` / `_italic_`, `` `code` ``, ` ```code fence``` `, `~~strike~~`, `||spoiler||` (converted to Signal's offset-based text styles)
 - Quoted replies — `replyTo*` fields populated from Signal quotes
-- Typing indicators — DMs only (Signal doesn't support group typing)
+- Typing indicators — DMs and groups (fires when the container is woken; refreshes every 4 s while the agent heartbeat is fresh; stops automatically when the agent goes idle)
 - Echo suppression — outbound messages matched on `(platformId, text)` within a 10 s TTL to avoid syncMessage loops
 - Note to Self — messages you send to your own account from another device route to the agent as inbound with `isFromMe: true`
 - Voice attachments — detected but not transcribed by default; the agent receives `[Voice Message]` placeholder text. Run `/add-voice-transcription` for local transcription via parakeet-mlx
 
-Not supported yet: outbound file attachments (logged and dropped), edit/delete messages, reactions.
+Not supported yet: outbound file attachments (logged and dropped), edit/delete messages, inbound reactions (silently dropped).
+
+### Outbound reactions
+
+The agent can react to a Signal message by emitting an outbound message with `operation: 'reaction'` in the content:
+
+```json
+{
+  "operation": "reaction",
+  "emoji": "👍",
+  "targetAuthorNumber": "+972XXXXXXXXX",
+  "targetTimestamp": 1716900000000
+}
+```
+
+- `targetAuthorNumber` — phone number of the person who sent the message being reacted to
+- `targetTimestamp` — the Signal timestamp of that message (same value as the nanoclaw message `id` field, which is the raw Signal epoch-ms timestamp)
+
+Works for both DMs and groups. To remove a reaction, react with the same emoji again — Signal toggles it off. The adapter does not expose an explicit `remove` flag.
 
 ## Troubleshooting
 
@@ -329,3 +347,31 @@ Install Java 17+ — see the Prerequisites section above.
 ### QR code expired (Path B)
 
 QR codes expire in ~30 seconds. Re-run the link command to generate a new one.
+
+### Bot doesn't respond to @mentions or quote-replies in groups
+
+Modern signal-cli uses UUID (ACI) as the primary identity. The `quote.authorNumber` field in
+quote-reply envelopes may be absent — making mention detection fail silently for replies to the
+bot's messages.
+
+**Root cause:** The isMention check previously relied solely on `quote.authorNumber` matching
+the bot's phone number. When signal-cli omits that field (common with UUID-primary contacts),
+the check falls through even though the user clearly directed the message at the bot.
+
+**Fix** (already in `src/channels/signal.ts`): The adapter now tracks timestamps of all
+outbound messages via the `syncMessage.sentMessage` echo that signal-cli delivers after every
+send. A `recentlySentTimestamps` set (capped at 200 entries) holds the last N outbound
+timestamps. When a group message arrives with a quote, `quote.id` (the timestamp of the quoted
+message) is checked against this set. A match means the bot's message was quoted, regardless of
+whether `quote.authorNumber` is present.
+
+**If you installed the Signal adapter before 2026-05-19**, re-copy `src/channels/signal.ts`
+from the upstream `channels` branch and rebuild:
+
+```bash
+git fetch origin channels
+git show origin/channels:src/channels/signal.ts > src/channels/signal.ts
+pnpm run build
+systemctl --user restart "$(. setup/lib/install-slug.sh && systemd_unit)"  # Linux
+# or: launchctl kickstart -k gui/$(id -u)/"$(. setup/lib/install-slug.sh && launchd_label)"  # macOS
+```
