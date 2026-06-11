@@ -41,6 +41,8 @@ signal-cli --version
 
 > The Linux native tarball extracts a single binary directly to `~/.local/signal-cli` (not into a subdirectory). The symlink above puts it on PATH.
 
+> **Minimum version: signal-cli ≥ 0.14.5.** Versions 0.14.4.x have a bug in `libsignal-service` that throws `NullPointerException: getServerGuid(...) must not be null` when decoding sealed-sender envelopes — all incoming messages arrive with null source/content and are silently dropped. The dynamic install above always fetches the latest release, so this only matters if you pinned an older version.
+
 ## Registration
 
 Two paths. The new-number path is recommended and battle-tested.
@@ -319,6 +321,40 @@ Signal responses show `platformMsgId=undefined` in the main log. This means the 
 ### Lost connection mid-session
 
 If you see `Signal channel lost TCP connection to signal-cli daemon` in the logs, the daemon dropped the connection. Restart the service to re-establish.
+
+### Incoming messages silently dropped — bot connects and sends but never receives
+
+**Symptom:** `Signal channel connected` appears in the log, outbound send works, but no incoming messages route through. No `Signal message received` lines appear regardless of how many messages you send.
+
+Two known causes, both fixed in the current adapter + signal-cli ≥ 0.14.5:
+
+**Cause 1 — signal-cli 0.14.4.x NullPointerException**
+
+signal-cli 0.14.4.x throws `NullPointerException: getServerGuid(...) must not be null` when decoding sealed-sender envelopes (the standard message format). All incoming messages arrive with `source/sourceNumber/sourceUuid: null` — the adapter discards them at the sender check with no log output.
+
+Fix: upgrade signal-cli to ≥ 0.14.5 (ships an updated libsignal-service):
+
+```bash
+# Linux — replaces the binary in place; NanoClaw respawns it on next restart
+SIGNAL_CLI_VERSION=$(curl -fsSL https://api.github.com/repos/AsamK/signal-cli/releases/latest | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'][1:])")
+curl -fsSL "https://github.com/AsamK/signal-cli/releases/download/v${SIGNAL_CLI_VERSION}/signal-cli-${SIGNAL_CLI_VERSION}-Linux-native.tar.gz" \
+  | tar -xz -C ~/.local
+systemctl --user restart "$(. setup/lib/install-slug.sh && systemd_unit)"
+```
+
+**Cause 2 — missing `subscribeReceive` call (signal-cli ≥ 0.14.x)**
+
+signal-cli ≥ 0.14.x changed the TCP daemon protocol: each client must call `subscribeReceive` after connecting before it will receive any push notifications. Without this call the TCP connection is established and outbound send works, but no `receive` events are pushed to the client.
+
+The adapter now calls `subscribeReceive` immediately after `tcp.connect()`. If you installed the Signal adapter before 2026-06-11, re-copy the adapter and rebuild:
+
+```bash
+git fetch origin channels
+git show origin/channels:src/channels/signal.ts > src/channels/signal.ts
+pnpm run build
+systemctl --user restart "$(. setup/lib/install-slug.sh && systemd_unit)"  # Linux
+# or: launchctl kickstart -k gui/$(id -u)/"$(. setup/lib/install-slug.sh && launchd_label)"  # macOS
+```
 
 ### Messages dropped with `not_member`
 
