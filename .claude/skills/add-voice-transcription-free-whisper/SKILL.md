@@ -190,21 +190,76 @@ Or switch to openai-whisper which downloads its own model automatically.
 model for better accuracy, or set the language explicitly (see whisper docs).
 
 **Voice messages delivered as attachments only, no transcript** — transcription
-is failing silently. Check `logs/nanoclaw.log` for `Audio transcription failed`
-and `logs/nanoclaw.error.log` for the underlying error. Verify ffmpeg and
-whisper are in PATH.
+is failing silently. Current `src/transcription.ts` logs failures at
+`log.debug`, which does **not** appear in `logs/nanoclaw.log` or
+`logs/nanoclaw.error.log` at default log level — a broken whisper install can
+go unnoticed indefinitely with zero trace in the logs. Verify manually instead:
+run the exact ffmpeg + whisper commands from "How it works" by hand against a
+copy of one of the failing attachments (under `data/attachments/` or your
+channel's attachment dir) and see where it actually breaks.
+
+**Works in your shell but not from the running service (Linux)** — `uv tool
+install` puts binaries in `~/.local/bin`, and `which whisper` succeeding in
+your interactive shell does not prove the systemd `--user` service can find
+it. Unit files commonly set an explicit, narrower `Environment=PATH=...` that
+silently omits `~/.local/bin` (or `/usr/local/bin`, if ffmpeg was installed as
+a static binary there). Check what the service actually has:
+```bash
+systemctl --user cat nanoclaw | grep 'Environment=PATH'
+```
+If the directory holding your `whisper`/`ffmpeg` binary isn't listed, add it
+to that line, then `systemctl --user daemon-reload && systemctl --user
+restart nanoclaw`. This exact mismatch is why an early version of this setup
+failed with `spawn ffmpeg ENOENT` under the service despite ffmpeg being
+installed and working from the terminal.
+
+**Whisper ran, produced a transcript file, but it's empty — for a real voice
+note with actual speech** — not necessarily a pipeline bug. openai-whisper's
+language auto-detection can misfire on short or quiet clips (e.g. detects
+Korean for a two-second Hebrew/English blip) and return nothing; NanoClaw
+treats an empty string identically to "no speech detected" — transcript is
+null, attachment delivered with no text, and the agent has no way to tell the
+difference from silence. If this happens often, pin the language explicitly
+(edit the `whisper` invocation in `transcribeOpenAIWhisper()` to add
+`--language en` or similar) or move to a larger `WHISPER_MODEL`.
 
 ---
 
 ## How it works
 
-`src/transcription.ts` wraps both backends behind a single `transcribeAudio(path)`
-call. It converts input audio to 16 kHz mono WAV via ffmpeg, then:
+**Transcription happens entirely in the host process — never inside the
+agent's container.** The agent has no whisper or ffmpeg of its own, and
+doesn't need any. If the agent ever tells a user it "can't transcribe voice
+messages (no speech-to-text tool installed)," that's the agent reasoning
+about its own sandbox — which has no STT and never will — not a statement
+about whether this skill's pipeline is working. It has no visibility into
+this step at all; from its point of view a voice note either already arrived
+as text, or it's just an audio attachment with nothing else to go on.
 
-- **whisper.cpp**: calls `whisper-cli -m MODEL -f file.wav -nt`, reads stdout
-- **openai-whisper**: calls `whisper file.wav --model NAME --output_format txt
-  --output_dir TMPDIR --fp16 False`, reads the `.txt` output file
+The governing loop, one message at a time (e.g. Signal):
 
-Channel adapters call `transcribeAudio()` on voice attachments before routing.
-If transcription returns null (error or no speech), the attachment is still
-delivered — the transcript text is simply omitted.
+1. The channel adapter (`src/channels/signal.ts`, running on the host)
+   receives the inbound message and detects a voice/audio attachment,
+   downloading it to disk.
+2. Still on the host, still before the message reaches the router, the
+   adapter calls `transcribeAudio(path)` in `src/transcription.ts`.
+3. `transcribeAudio` shells out to `ffmpeg` to downsample the attachment to
+   16 kHz mono WAV, then to the configured whisper backend:
+   - **whisper.cpp**: calls `whisper-cli -m MODEL -f file.wav -nt`, reads stdout
+   - **openai-whisper**: calls `whisper file.wav --model NAME --output_format
+     txt --output_dir TMPDIR --fp16 False`, reads the `.txt` output file
+4. If a transcript comes back, the adapter rewrites the message content to
+   `[Voice: <transcript>]` — that's the string the router writes into the
+   session's `inbound.db`, and the only thing the agent ever sees. The raw
+   audio is still delivered as an attachment; only the text is synthesized
+   on top of it.
+5. If transcription returns null (no backend configured, ffmpeg/whisper
+   error, or genuinely no speech detected), the message is routed with no
+   transcript at all — attachment-only, identical to never having installed
+   this skill. The agent then has nothing but a bare attachment to react to.
+
+**Practical consequence:** `WHISPER_BIN` / `WHISPER_MODEL` and the whisper
+binary itself are host concerns. Applying a fix means restarting the **host**
+service (`systemctl --user restart nanoclaw` / `launchctl kickstart ...`),
+not `ncl groups restart` — the agent's container never runs whisper or reads
+those env vars, so restarting it changes nothing here.
