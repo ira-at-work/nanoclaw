@@ -272,6 +272,7 @@ Otherwise, run `/init-first-agent` to create an agent and wire it to your Signal
 - Echo suppression — outbound messages matched on `(platformId, text)` within a 10 s TTL to avoid syncMessage loops
 - Note to Self — messages you send to your own account from another device route to the agent as inbound with `isFromMe: true`
 - Voice attachments — detected but not transcribed by default; the agent receives `[Voice Message]` placeholder text. Run `/add-voice-transcription` for local transcription via parakeet-mlx
+- Inbound image/file attachments — non-audio attachments (images, PDFs, text files, etc.) are read from `signalDataDir/attachments/<id>` and forwarded as base64 through the same inbound-attachment mechanism every other channel uses, so the agent's Read tool can open them and vision-capable models can see images. See the Troubleshooting entry below if your copy predates this fix.
 
 Not supported yet: outbound file attachments (logged and dropped), edit/delete messages, inbound reactions (silently dropped).
 
@@ -383,6 +384,22 @@ Install Java 17+ — see the Prerequisites section above.
 ### QR code expired (Path B)
 
 QR codes expire in ~30 seconds. Re-run the link command to generate a new one.
+
+### Images and file attachments not reaching the agent
+
+**Symptom:** Voice messages transcribe fine, but images sent over Signal are never seen by the agent, and other attachments (PDFs, text files, documents) are ignored entirely — no error, no placeholder text, nothing in the response referencing them.
+
+**Root cause:** The original adapter spliced a `/workspace/extra/signal-attachments/<id>` path directly into the message text for image attachments only — a path that was never mounted into the agent's container, so the Read tool could never open it. Every non-image, non-audio attachment was silently dropped before that point, with no path emitted at all. Tracked upstream as issue [#2528](https://github.com/nanocoai/nanoclaw/issues/2528); fixes proposed in PRs [#2529](https://github.com/nanocoai/nanoclaw/pull/2529), [#2695](https://github.com/nanocoai/nanoclaw/pull/2695), and [#3142](https://github.com/nanocoai/nanoclaw/pull/3142).
+
+**Fix:** The adapter now reads attachment bytes from `signalDataDir/attachments/<id>` and forwards them as base64 through `extractAttachmentFiles` (`session-manager.ts`) — the same inbound-attachment mechanism WhatsApp, Discord, Slack, and Telegram already use — which writes them into the session's mounted inbox directory. If your copy of `src/channels/signal.ts` predates this fix, re-copy it from the `channels` branch and rebuild:
+
+```bash
+git fetch origin channels
+git show origin/channels:src/channels/signal.ts > src/channels/signal.ts
+pnpm run build
+systemctl --user restart "$(. setup/lib/install-slug.sh && systemd_unit)"  # Linux
+# or: launchctl kickstart -k gui/$(id -u)/"$(. setup/lib/install-slug.sh && launchd_label)"  # macOS
+```
 
 ### Bot doesn't respond to @mentions or quote-replies in groups
 
