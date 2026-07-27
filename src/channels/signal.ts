@@ -612,10 +612,10 @@ export function createSignalAdapter(config: {
     const text = rawText ? resolveMentions(rawText, dataMessage.mentions) : '';
 
     const audioAttachment = dataMessage.attachments?.find((a) => a.contentType?.startsWith('audio/') && a.id);
-    const imageAttachments = dataMessage.attachments?.filter((a) => a.contentType?.startsWith('image/') && a.id) ?? [];
+    const fileAttachments = dataMessage.attachments?.filter((a) => !a.contentType?.startsWith('audio/') && a.id) ?? [];
     const hasVoice = !text && !!audioAttachment;
 
-    if (!text && !hasVoice && imageAttachments.length === 0) return;
+    if (!text && !hasVoice && fileAttachments.length === 0) return;
 
     const sender = (envelope.sourceNumber ?? envelope.sourceUuid ?? envelope.source ?? '').trim();
     if (!sender) return;
@@ -670,16 +670,37 @@ export function createSignalAdapter(config: {
       }
     }
 
-    // Image attachments — emit `[Image: <path>]` lines so the agent's Read
-    // tool can pick them up, and surface the structured `attachments` array
-    // for consumers that prefer that shape. Without this, vision-capable
-    // models never see images sent over Signal.
-    const attachmentRefs: Array<{ path: string; contentType: string }> = [];
-    for (const img of imageAttachments) {
-      const imagePath = join(config.signalDataDir, 'attachments', img.id!);
-      const imageLine = `[Image: ${imagePath}]`;
-      content = content ? `${content}\n${imageLine}` : imageLine;
-      attachmentRefs.push({ path: imagePath, contentType: img.contentType || 'image/jpeg' });
+    // Non-audio attachments (images, documents, etc.) — read the bytes and
+    // hand them to the generic inbound-attachment mechanism
+    // (extractAttachmentFiles in session-manager.ts), same as every other
+    // channel. That writes the bytes into the session's inbox dir, which
+    // *is* mounted into the container, so the agent's Read tool can
+    // actually open the file. The previous approach spliced a
+    // `/workspace/extra/signal-attachments/<id>` path directly into the
+    // message text — a path that was never mounted anywhere, so it always
+    // failed, and it silently dropped any non-image, non-audio attachment
+    // (documents, text files, etc.) entirely.
+    const fileEntries: Array<{ type: string; name?: string; mimeType?: string; size?: number; data: string }> = [];
+    for (const file of fileAttachments) {
+      const hostPath = join(config.signalDataDir, 'attachments', file.id!);
+      if (!existsSync(hostPath)) {
+        log.warn('Signal: attachment file not found', { id: file.id, path: hostPath });
+        continue;
+      }
+      fileEntries.push({
+        type: file.contentType?.startsWith('image/') ? 'image' : 'file',
+        name: file.filename,
+        mimeType: file.contentType,
+        size: file.size,
+        data: readFileSync(hostPath).toString('base64'),
+      });
+    }
+
+    // All attachments failed to read (e.g. signal-cli hadn't finished
+    // downloading yet) and there's no other text — say so instead of
+    // silently delivering an empty message, mirroring the voice fallback.
+    if (!content && fileAttachments.length > 0 && fileEntries.length === 0) {
+      content = '[Attachment not found]';
     }
 
     const msg: InboundMessage = {
@@ -690,7 +711,7 @@ export function createSignalAdapter(config: {
         sender,
         senderId: `signal:${sender}`,
         senderName,
-        ...(attachmentRefs.length > 0 ? { attachments: attachmentRefs } : {}),
+        ...(fileEntries.length > 0 ? { attachments: fileEntries } : {}),
         ...(dataMessage.quote ? quoteToContent(dataMessage.quote) : {}),
       },
       isMention: computeSignalIsMention(config.account, isGroup, dataMessage.mentions),
