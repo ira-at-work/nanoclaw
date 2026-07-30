@@ -1,55 +1,205 @@
 ---
 name: add-signal
-description: Add Signal channel integration via signal-cli TCP daemon. Native adapter — no Chat SDK bridge.
+description: Add Signal channel integration via signal-cli device-link. Native adapter — no Chat SDK bridge.
 ---
 
 # Add Signal Channel
 
-Adds Signal messaging support via a native adapter that speaks JSON-RPC to a [signal-cli](https://github.com/AsamK/signal-cli) TCP daemon. No Chat SDK bridge — only Node.js builtins (`node:net`, `node:child_process`, `node:fs`).
+Adds Signal support via a native adapter that speaks JSON-RPC to a
+[signal-cli](https://github.com/AsamK/signal-cli) daemon — no Chat SDK bridge,
+only Node.js builtins. NanoClaw links to Signal as a *secondary device* on your
+existing phone: no new number, no bot API. Your assistant sends and receives as
+the number on the phone that scans the link.
 
-Unlike Telegram or Discord, Signal has no bot API. NanoClaw registers as a full Signal account on a dedicated phone number (recommended) or links as a secondary device on your existing number.
+## Apply
 
-## Prerequisites
+### 1. Install signal-cli
 
-### Java
+NanoClaw talks to Signal through signal-cli, which has no bot API of its own.
+Install it if it isn't on PATH yet — Homebrew on macOS, the native release binary
+on Linux (neither needs Java). If it's already installed this is a no-op:
 
-signal-cli requires Java 17+:
-
-```bash
-java -version
+```nc:run effect:external
+command -v signal-cli >/dev/null 2>&1 || bash setup/install-signal-cli.sh
 ```
 
-If missing:
-- **macOS:** `brew install --cask temurin@17`
-- **Debian/Ubuntu:** `sudo apt-get install -y default-jre`
-- **RHEL/Fedora:** `sudo dnf install -y java-17-openjdk`
+### 2. Copy the adapter and its registration test
 
-Java 17–25 all work.
+Fetch the `channels` branch and copy the Signal adapter and its registration test
+into `src/channels/` (overwrite — the branch is canonical):
 
-### signal-cli
-
-- **macOS:** `brew install signal-cli`
-- **Linux:** download the native binary from [GitHub releases](https://github.com/AsamK/signal-cli/releases):
-
-```bash
-SIGNAL_CLI_VERSION=$(curl -fsSL https://api.github.com/repos/AsamK/signal-cli/releases/latest | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'][1:])")
-curl -fsSL "https://github.com/AsamK/signal-cli/releases/download/v${SIGNAL_CLI_VERSION}/signal-cli-${SIGNAL_CLI_VERSION}-Linux-native.tar.gz" \
-  | tar -xz -C ~/.local
-ln -sf ~/.local/signal-cli ~/.local/bin/signal-cli
-signal-cli --version
+```nc:copy from-branch:channels
+src/channels/signal.ts
+src/channels/signal-registration.test.ts
 ```
 
-> The Linux native tarball extracts a single binary directly to `~/.local/signal-cli` (not into a subdirectory). The symlink above puts it on PATH.
+### 3. Register the adapter
 
-> **Minimum version: signal-cli ≥ 0.14.5.** Versions 0.14.4.x have a bug in `libsignal-service` that throws `NullPointerException: getServerGuid(...) must not be null` when decoding sealed-sender envelopes — all incoming messages arrive with null source/content and are silently dropped. The dynamic install above always fetches the latest release, so this only matters if you pinned an older version.
+Append the self-registration import to the channel barrel (skipped if the line is
+already present). This one line is the skill's only reach-in into core:
 
-## Registration
+```nc:append to:src/channels/index.ts
+import './signal.js';
+```
 
-Two paths. The new-number path is recommended and battle-tested.
+### 4. Install the QR-rendering dependency
 
-### Path A: Register a new number (recommended)
+The device-link step renders the linking URL as a terminal QR via `qrcode`.
+Pinned to exact versions — the supply-chain policy rejects ranges and `latest`:
 
-Use a dedicated SIM or VoIP number. NanoClaw owns it entirely.
+```nc:dep
+qrcode@1.5.4
+@types/qrcode@1.5.6
+```
+
+The adapter itself consumes only Node.js builtins, so there is no adapter package
+to install — `qrcode` is purely for rendering the link during setup.
+
+### 5. Build and validate
+
+Build first: it guards the adapter's typed core-API consumption. Then run the one
+integration test.
+
+```nc:run effect:build
+pnpm run build
+```
+```nc:run effect:test
+pnpm exec vitest run src/channels/signal-registration.test.ts
+```
+
+`signal-registration.test.ts` imports the real channel barrel and asserts the
+registry contains `signal`. It goes red if the `import './signal.js';` line is
+deleted or drifts, or if the barrel fails to evaluate — so the channel genuinely
+would not register. The adapter has no npm dependency to guard; its typed
+core-API consumption is covered by the build. End-to-end delivery against a real
+Signal account is verified manually once the service runs.
+
+## Link your Signal account
+
+This is the whole credential step. signal-cli opens a device-link handshake,
+prints a `sgnl://linkdevice…` URL, and renders it as a scannable QR. You scan it
+once from the phone that already runs Signal; that phone's number becomes the
+account NanoClaw sends and receives as — no number is registered.
+
+The device-link runs signal-cli, so it must be reachable first — on `PATH`, or at
+`$SIGNAL_CLI_PATH`. If step 1's install didn't land, the link step has nothing to
+drive; confirm it's present before linking (re-run step 1 if this fails):
+
+```nc:run effect:check
+command -v signal-cli >/dev/null 2>&1 || [ -x "$SIGNAL_CLI_PATH" ]
+```
+
+Tell the user:
+
+```nc:operator
+Link NanoClaw to your Signal account:
+1. On the phone that runs Signal, open Signal → Settings → Linked Devices → Link New Device.
+2. Scan the QR code shown below — or open the `sgnl://linkdevice…` link printed under it on that phone.
+3. Wait for confirmation. The linking URL expires after ~3 minutes; re-run this step for a fresh one.
+```
+
+Run the device-link. It blocks until you scan, then reports the linked phone
+number back as the account — that number is both your owner handle and the
+conversation address the wiring step needs:
+
+```nc:run effect:step capture:platform_id=ACCOUNT,owner_handle=ACCOUNT
+pnpm exec tsx setup/index.ts --step signal-auth
+```
+
+`owner_handle` and `platform_id` both come back as the bare phone number (e.g.
+`+15551234567`). Your assistant reaches you through Signal's Note to Self, so the
+owner conversation is addressed by your own number — not a per-contact UUID.
+
+## Persist the account
+
+Store the linked number so the adapter binds the right account on start, then sync
+it into the container env:
+
+```nc:env-set
+SIGNAL_ACCOUNT={{platform_id}}
+```
+## Restart
+
+Restart the service so it loads the Signal adapter and binds the account you just
+linked, and wait for its CLI socket before wiring:
+
+```nc:run effect:restart
+bash setup/lib/restart.sh
+```
+
+## Wiring
+
+### DMs
+
+After the service starts, send any message to the Signal number from your
+personal Signal app. The router auto-creates a `messaging_groups` row. Then:
+
+```bash
+pnpm exec tsx scripts/q.ts data/v2.db \
+  "SELECT id, platform_id FROM messaging_groups WHERE channel_type='signal' ORDER BY created_at DESC LIMIT 5"
+```
+
+Pass the `id` to `/init-first-agent` or `/manage-channels` to wire it to an agent group.
+
+### Groups
+
+Add the Signal number to a group from your phone, send any message, then wire the resulting row the same way. Each group gets its own session with the default `shared` mode (one session per agent + messaging group). Create the wiring with `ncl` — **the host service must be running** (`ncl` connects to it over a Unix socket):
+
+```bash
+# Engage mode/pattern default to the Signal adapter's declared channel defaults
+ncl wirings create --messaging-group-id mg-GROUPID --agent-group-id ag-AGENTID
+```
+
+### Grant user access
+
+New Signal users (including the owner's Signal identity) are silently dropped with `not_member` until granted access. After the user's first message appears in `messaging_groups` (host service running):
+
+```bash
+ncl users create --id "signal:UUID" --kind signal --display-name "<name>"
+ncl roles grant --user "signal:UUID" --role owner
+ncl members add --user "signal:UUID" --group ag-AGENTID
+```
+
+Find the UUID from `messaging_groups.platform_id` or the `users` table.
+
+## Next Steps
+
+If you're in the middle of `/setup`, return to the setup flow now. Otherwise wire
+this channel with `/init-first-agent` (or `/manage-channels`).
+
+## Channel Info
+
+- **type**: `signal`
+- **terminology**: Signal has "chats" (1:1 DMs) and "groups." The owner reaches their own assistant through Note to Self.
+- **platform-id-format**:
+  - Owner DM (Note to Self): the bare phone number `+<number>` (e.g. `+15551234567`) — your own messages route back as inbound with `isFromMe`, addressed by your number.
+  - Third-party DM: `signal:{UUID}` — the sender's Signal ACI, **not** their phone number.
+  - Group: `signal:{base64GroupId}` — base64-encoded GroupV2 ID.
+- **how-to-find-id**: The owner number comes back from the device-link step above. For third parties or groups, send a message to the bot, then query `messaging_groups`.
+- **supports-threads**: no
+- **typical-use**: Personal assistant via Signal DMs or small group chats
+- **default-isolation**: One agent per Signal account. Multiple chats with the same operator can share an agent group; groups with other people should typically get their own agent group (the default `shared` session mode already gives each messaging group its own session).
+
+### Features
+
+- Markdown formatting — `**bold**`, `*italic*` / `_italic_`, `` `code` ``, ` ```code fence``` `, `~~strike~~`, `||spoiler||` (converted to Signal's offset-based text styles).
+- Quoted replies — `replyTo*` fields populated from Signal quotes.
+- Typing indicators — DMs and groups.
+- Note to Self — messages you send to your own account from another device route to the agent as inbound with `isFromMe: true`.
+- Voice attachments — detected but not transcribed by default; the agent receives a `[Voice Message]` placeholder. Run `/add-voice-transcription` for local transcription.
+- Inbound image/file attachments — forwarded to the agent the same way every other chat adapter does. See Troubleshooting below if your copy predates the fix.
+- Outbound reactions — the agent can react to a message with `{"operation": "reaction", "emoji": "👍", "targetAuthorNumber": "+1555...", "targetTimestamp": 1716900000000}` as the outbound content, where `targetTimestamp` is the Signal message's own timestamp. Works in DMs and groups; reacting again with the same emoji toggles it off.
+
+Not supported yet: outbound file attachments (logged and dropped), edit/delete messages, inbound reactions (silently dropped).
+
+## Alternatives
+
+### Register a dedicated number instead of linking
+
+The device-link above joins Signal as a *secondary device* on an existing number.
+If you'd rather give the assistant its own number, register a dedicated SIM or
+VoIP number that NanoClaw owns entirely. This path takes a captcha, an SMS (or
+voice) verification, and an optional profile name.
 
 > **VoIP numbers:** Signal requires SMS verification before voice. Some VoIP providers are blocked even for voice calls. If registration fails with an auth error, try a different provider or a physical SIM.
 
@@ -109,65 +259,12 @@ signal-cli -a +1YOURNUMBER updateProfile --name "YourBotName"
 systemctl --user start $(systemd_unit)
 ```
 
-### Path B: Link as secondary device
+Once registered, set `SIGNAL_ACCOUNT` to this number (as under **Persist the account** above) and restart the service.
 
-Joins an existing Signal account as a secondary device. Simpler, but NanoClaw shares your personal number.
+## Optional configuration
 
-```bash
-signal-cli -a +1YOURNUMBER link --name "NanoClaw"
-```
-
-This prints a `tsdevice:` URI. Scan it as a QR code on your phone: **Settings → Linked Devices → Link New Device**. QR codes expire in ~30 seconds — re-run if it expires.
-
-## Install
-
-### Pre-flight (idempotent)
-
-Skip to **Credentials** if all of these are already in place:
-
-- `src/channels/signal.ts` and `src/channels/signal.test.ts` both exist
-- `src/channels/index.ts` contains `import './signal.js';`
-
-Otherwise continue. Every step below is safe to re-run.
-
-### 1. Fetch the channels branch
-
-```bash
-git fetch origin channels
-```
-
-### 2. Copy the adapter and tests
-
-```bash
-git show origin/channels:src/channels/signal.ts      > src/channels/signal.ts
-git show origin/channels:src/channels/signal.test.ts > src/channels/signal.test.ts
-```
-
-### 3. Append the self-registration import
-
-Append to `src/channels/index.ts` (skip if the line is already present):
-
-```typescript
-import './signal.js';
-```
-
-### 4. Build
-
-```bash
-pnpm run build
-```
-
-No npm packages to install — the adapter uses only Node.js builtins.
-
-## Credentials
-
-Add to `.env`:
-
-```bash
-SIGNAL_ACCOUNT=+1YOURNUMBER
-```
-
-### Optional settings
+These `.env` keys tune how NanoClaw talks to the signal-cli daemon. All are
+optional — the defaults work for the device-link flow above.
 
 ```bash
 # TCP daemon host and port (default: 127.0.0.1:7583)
@@ -187,113 +284,6 @@ SIGNAL_DATA_DIR=~/.local/share/signal-cli
 
 **Security note:** keep the TCP host on `127.0.0.1`. The daemon has no auth — binding it to a public interface would expose your full Signal account to the network.
 
-Sync to container: `mkdir -p data/env && cp .env data/env/env`
-
-### Restart
-
-Run from your NanoClaw project root:
-
-```bash
-source setup/lib/install-slug.sh
-
-# macOS
-launchctl kickstart -k gui/$(id -u)/$(launchd_label)
-
-# Linux
-systemctl --user restart $(systemd_unit)
-```
-
-## Wiring
-
-### DMs
-
-After the service starts, send any message to the Signal number from your personal Signal app. The router auto-creates a `messaging_groups` row. Then:
-
-```bash
-pnpm exec tsx scripts/q.ts data/v2.db \
-  "SELECT id, platform_id FROM messaging_groups WHERE channel_type='signal' ORDER BY created_at DESC LIMIT 5"
-```
-
-Pass the `id` to `/init-first-agent` or `/manage-channels` to wire it to an agent group.
-
-### Groups
-
-Add the Signal number to a group from your phone, send any message, then wire the resulting row the same way. For isolated per-group sessions:
-
-```bash
-NOW=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
-pnpm exec tsx scripts/q.ts data/v2.db "
-INSERT OR IGNORE INTO messaging_group_agents
-  (id, messaging_group_id, agent_group_id, session_mode, priority, created_at)
-VALUES
-  ('mga-'||hex(randomblob(8)), 'mg-GROUPID', 'ag-AGENTID', 'isolated', 0, '$NOW');
-"
-```
-
-### Grant user access
-
-New Signal users (including the owner's Signal identity) are silently dropped with `not_member` until granted access. After the user's first message appears in `messaging_groups`:
-
-```bash
-NOW=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
-pnpm exec tsx scripts/q.ts data/v2.db "
-INSERT OR REPLACE INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at)
-  VALUES ('signal:UUID', 'owner', NULL, 'system', '$NOW');
-INSERT OR IGNORE INTO agent_group_members (user_id, agent_group_id, added_by, added_at)
-  VALUES ('signal:UUID', 'ag-AGENTID', 'system', '$NOW');
-"
-```
-
-Find the UUID from `messaging_groups.platform_id` or the `users` table.
-
-## Next Steps
-
-If you're in the middle of `/setup`, return to the setup flow now.
-
-Otherwise, run `/init-first-agent` to create an agent and wire it to your Signal DM, or `/manage-channels` to wire this channel to an existing agent group.
-
-## Channel Info
-
-- **type**: `signal`
-- **terminology**: Signal has "chats" (1:1 DMs) and "groups"
-- **supports-threads**: no
-- **platform-id-format**:
-  - DM: `signal:{UUID}` — sender's Signal UUID (ACI), **not** their phone number
-  - Group: `signal:{base64GroupId}` — base64-encoded GroupV2 ID
-- **how-to-find-id**: Send a message to the bot, then query `messaging_groups` as shown above
-- **typical-use**: Personal assistant via Signal DMs or small group chats
-- **default-isolation**: One agent per Signal account. Multiple chats with the same operator can share an agent group; groups with other people should typically use `isolated` session mode
-
-### Features
-
-- Markdown formatting — `**bold**`, `*italic*` / `_italic_`, `` `code` ``, ` ```code fence``` `, `~~strike~~`, `||spoiler||` (converted to Signal's offset-based text styles)
-- Quoted replies — `replyTo*` fields populated from Signal quotes
-- Typing indicators — DMs and groups (fires when the container is woken; refreshes every 4 s while the agent heartbeat is fresh; stops automatically when the agent goes idle)
-- Echo suppression — outbound messages matched on `(platformId, text)` within a 10 s TTL to avoid syncMessage loops
-- Note to Self — messages you send to your own account from another device route to the agent as inbound with `isFromMe: true`
-- Voice attachments — detected but not transcribed by default; the agent receives `[Voice Message]` placeholder text. Run `/add-voice-transcription` for local transcription via parakeet-mlx
-- Inbound image/file attachments — non-audio attachments (images, PDFs, text files, etc.) are read from `signalDataDir/attachments/<id>` and forwarded as base64 through the same inbound-attachment mechanism every other channel uses, so the agent's Read tool can open them and vision-capable models can see images. See the Troubleshooting entry below if your copy predates this fix.
-
-Not supported yet: outbound file attachments (logged and dropped), edit/delete messages, inbound reactions (silently dropped).
-
-### Outbound reactions
-
-The agent can react to a Signal message by emitting an outbound message with `operation: 'reaction'` in the content:
-
-```json
-{
-  "operation": "reaction",
-  "emoji": "👍",
-  "targetAuthorNumber": "+972XXXXXXXXX",
-  "targetTimestamp": 1716900000000
-}
-```
-
-- `targetAuthorNumber` — phone number of the person who sent the message being reacted to
-- `targetTimestamp` — the Signal timestamp of that message (same value as the nanoclaw message `id` field, which is the raw Signal epoch-ms timestamp)
-
-Works for both DMs and groups. To remove a reaction, react with the same emoji again — Signal toggles it off. The adapter does not expose an explicit `remove` flag.
-
 ## Troubleshooting
 
 ### Daemon not reachable
@@ -304,9 +294,17 @@ grep "Signal" logs/nanoclaw.log | tail
 
 If you see `Signal daemon failed to start. Is signal-cli installed and your account linked?`:
 - Confirm `signal-cli` is on PATH (or set `SIGNAL_CLI_PATH`)
-- Confirm the account is linked: `signal-cli -a +1YOURNUMBER listIdentities` should succeed without prompting
+- Confirm the account is linked: `signal-cli -a +YOURNUMBER listIdentities` should succeed without prompting
 
-If you see `Signal daemon not reachable at 127.0.0.1:7583` and `SIGNAL_MANAGE_DAEMON=false`, start the daemon yourself: `signal-cli -a +1YOURNUMBER daemon --tcp 127.0.0.1:7583`.
+If you see `Signal daemon not reachable at 127.0.0.1:7583` and `SIGNAL_MANAGE_DAEMON=false`, start the daemon yourself: `signal-cli -a +YOURNUMBER daemon --tcp 127.0.0.1:7583`.
+
+### Incoming messages silently stop arriving after a while
+
+**Symptom:** `Signal channel connected` still logs fine and outbound sends still work, but no incoming messages route through anymore — no `Signal message received` lines at all.
+
+**Root cause:** Signal-side protocol changes have broken this twice already on an aging signal-cli: a `NullPointerException` decoding sealed-sender envelopes on 0.14.4.x, and (separately) a `subscribeReceive` handshake that signal-cli ≥0.14.x started requiring before it will push anything. The adapter handles both today, but only if signal-cli itself is reasonably current — this class of breakage recurs every few months as upstream Signal changes the wire protocol, so don't leave signal-cli pinned to an old version.
+
+**Fix:** Upgrade signal-cli to the latest release and restart the service.
 
 ### Bot not responding
 
@@ -319,47 +317,21 @@ If you see `Signal daemon not reachable at 127.0.0.1:7583` and `SIGNAL_MANAGE_DA
 
 Signal responses show `platformMsgId=undefined` in the main log. This means the delivery poll ran but found no adapter — likely a duplicate service instance issue (see above). Affected messages cannot be retried; the user must resend.
 
+### Images and file attachments not reaching the agent
+
+**Symptom:** Voice messages transcribe fine, but images sent over Signal are never seen by the agent, and other attachments (PDFs, text files, documents) are silently ignored — no error, no placeholder text, nothing in the response referencing them.
+
+**Root cause:** An earlier version of the adapter spliced an unmounted local path into the message text for image attachments only, which the agent's Read tool could never open; every other attachment type was dropped before that point with no path emitted at all.
+
+**Fix:** Attachments are read from disk and forwarded as base64 through the same inbound-attachment mechanism the other chat adapters already use (see `whatsapp.ts` or `discord.ts` for the pattern). If your copy of `src/channels/signal.ts` predates this, re-copy it and rebuild — see **Copy the adapter and its registration test** above.
+
 ### Lost connection mid-session
 
 If you see `Signal channel lost TCP connection to signal-cli daemon` in the logs, the daemon dropped the connection. Restart the service to re-establish.
 
-### Incoming messages silently dropped — bot connects and sends but never receives
-
-**Symptom:** `Signal channel connected` appears in the log, outbound send works, but no incoming messages route through. No `Signal message received` lines appear regardless of how many messages you send.
-
-Two known causes, both fixed in the current adapter + signal-cli ≥ 0.14.5:
-
-**Cause 1 — signal-cli 0.14.4.x NullPointerException**
-
-signal-cli 0.14.4.x throws `NullPointerException: getServerGuid(...) must not be null` when decoding sealed-sender envelopes (the standard message format). All incoming messages arrive with `source/sourceNumber/sourceUuid: null` — the adapter discards them at the sender check with no log output.
-
-Fix: upgrade signal-cli to ≥ 0.14.5 (ships an updated libsignal-service):
-
-```bash
-# Linux — replaces the binary in place; NanoClaw respawns it on next restart
-SIGNAL_CLI_VERSION=$(curl -fsSL https://api.github.com/repos/AsamK/signal-cli/releases/latest | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'][1:])")
-curl -fsSL "https://github.com/AsamK/signal-cli/releases/download/v${SIGNAL_CLI_VERSION}/signal-cli-${SIGNAL_CLI_VERSION}-Linux-native.tar.gz" \
-  | tar -xz -C ~/.local
-systemctl --user restart "$(. setup/lib/install-slug.sh && systemd_unit)"
-```
-
-**Cause 2 — missing `subscribeReceive` call (signal-cli ≥ 0.14.x)**
-
-signal-cli ≥ 0.14.x changed the TCP daemon protocol: each client must call `subscribeReceive` after connecting before it will receive any push notifications. Without this call the TCP connection is established and outbound send works, but no `receive` events are pushed to the client.
-
-The adapter now calls `subscribeReceive` immediately after `tcp.connect()`. If you installed the Signal adapter before 2026-06-11, re-copy the adapter and rebuild:
-
-```bash
-git fetch origin channels
-git show origin/channels:src/channels/signal.ts > src/channels/signal.ts
-pnpm run build
-systemctl --user restart "$(. setup/lib/install-slug.sh && systemd_unit)"  # Linux
-# or: launchctl kickstart -k gui/$(id -u)/"$(. setup/lib/install-slug.sh && launchd_label)"  # macOS
-```
-
 ### Messages dropped with `not_member`
 
-The Signal user hasn't been granted membership. See "Grant user access" above. This affects every new Signal user, including the owner's Signal identity — which is a separate user record from their identity on other channels even if it's the same person.
+The Signal user hasn't been granted membership. New Signal senders — including the owner's Signal identity — are gated until granted access. `/init-first-agent` grants the owner automatically; for other users, grant access as shown under **Grant user access** in the Wiring section (or via `/manage-channels`) after their first message appears in `messaging_groups`. This affects every new Signal user, since their Signal identity is a separate user record from their identity on other channels even if it's the same person.
 
 ### Captcha required
 
@@ -377,54 +349,14 @@ signal-cli holds an exclusive lock on its data directory while the daemon is run
 
 Modern Signal groups use GroupV2. The adapter must extract the group ID from `envelope?.dataMessage?.groupV2?.id` — not `groupInfo?.groupId`, which is GroupV1/legacy. If group messages are routing as DMs, check `src/channels/signal.ts` and confirm the groupId extraction falls through to `groupV2.id`.
 
-### Java not found
+### Bot doesn't recognize a quote-reply as a mention in groups
 
-Install Java 17+ — see the Prerequisites section above.
+Modern signal-cli identifies contacts primarily by UUID (ACI), so a quote-reply envelope's `quote.authorNumber` field can come back empty even though the reply clearly targets the bot. The mention check needs to also match `quote.authorUuid` against the bot's own UUID, not just the phone number. Already handled in `src/channels/signal.ts`'s `isMention` check — if this regresses after a signal-cli upgrade, that's the fallback to check first.
 
-### QR code expired (Path B)
+### QR / linking URL expired
 
-QR codes expire in ~30 seconds. Re-run the link command to generate a new one.
+The `sgnl://linkdevice…` URL (and the Path A registration captcha) expire after a few minutes. Re-run the device-link step to get a fresh QR.
 
-### Images and file attachments not reaching the agent
+### Trunk updated but wiring defaults unchanged (stale adapter copy)
 
-**Symptom:** Voice messages transcribe fine, but images sent over Signal are never seen by the agent, and other attachments (PDFs, text files, documents) are ignored entirely — no error, no placeholder text, nothing in the response referencing them.
-
-**Root cause:** The original adapter spliced a `/workspace/extra/signal-attachments/<id>` path directly into the message text for image attachments only — a path that was never mounted into the agent's container, so the Read tool could never open it. Every non-image, non-audio attachment was silently dropped before that point, with no path emitted at all. Tracked upstream as issue [#2528](https://github.com/nanocoai/nanoclaw/issues/2528); fixes proposed in PRs [#2529](https://github.com/nanocoai/nanoclaw/pull/2529), [#2695](https://github.com/nanocoai/nanoclaw/pull/2695), and [#3142](https://github.com/nanocoai/nanoclaw/pull/3142).
-
-**Fix:** The adapter now reads attachment bytes from `signalDataDir/attachments/<id>` and forwards them as base64 through `extractAttachmentFiles` (`session-manager.ts`) — the same inbound-attachment mechanism WhatsApp, Discord, Slack, and Telegram already use — which writes them into the session's mounted inbox directory. If your copy of `src/channels/signal.ts` predates this fix, re-copy it from the `channels` branch and rebuild:
-
-```bash
-git fetch origin channels
-git show origin/channels:src/channels/signal.ts > src/channels/signal.ts
-pnpm run build
-systemctl --user restart "$(. setup/lib/install-slug.sh && systemd_unit)"  # Linux
-# or: launchctl kickstart -k gui/$(id -u)/"$(. setup/lib/install-slug.sh && launchd_label)"  # macOS
-```
-
-### Bot doesn't respond to @mentions or quote-replies in groups
-
-Modern signal-cli uses UUID (ACI) as the primary identity. The `quote.authorNumber` field in
-quote-reply envelopes may be absent — making mention detection fail silently for replies to the
-bot's messages.
-
-**Root cause:** The isMention check previously relied solely on `quote.authorNumber` matching
-the bot's phone number. When signal-cli omits that field (common with UUID-primary contacts),
-the check falls through even though the user clearly directed the message at the bot.
-
-**Fix** (already in `src/channels/signal.ts`): The adapter now tracks timestamps of all
-outbound messages via the `syncMessage.sentMessage` echo that signal-cli delivers after every
-send. A `recentlySentTimestamps` set (capped at 200 entries) holds the last N outbound
-timestamps. When a group message arrives with a quote, `quote.id` (the timestamp of the quoted
-message) is checked against this set. A match means the bot's message was quoted, regardless of
-whether `quote.authorNumber` is present.
-
-**If you installed the Signal adapter before 2026-05-19**, re-copy `src/channels/signal.ts`
-from the upstream `channels` branch and rebuild:
-
-```bash
-git fetch origin channels
-git show origin/channels:src/channels/signal.ts > src/channels/signal.ts
-pnpm run build
-systemctl --user restart "$(. setup/lib/install-slug.sh && systemd_unit)"  # Linux
-# or: launchctl kickstart -k gui/$(id -u)/"$(. setup/lib/install-slug.sh && launchd_label)"  # macOS
-```
+`src/channels/signal.ts` declares its own `SIGNAL_DEFAULTS` (engage mode, threading, unknown-sender policy) — that lives in the adapter copy installed from the `channels` branch, not in trunk. Running `/update-nanoclaw` without the follow-up skill-update step leaves the old adapter copy in place, so trunk-level behavior changes documented there silently don't apply to Signal. Fix: re-run `/add-signal` (or `/update-skills`) to pull the current adapter, then restart the service.
