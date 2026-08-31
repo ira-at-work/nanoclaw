@@ -14,9 +14,17 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import type { ChannelAdapter, ChannelDefaults, ChannelSetup, InboundMessage, OutboundMessage } from './adapter.js';
+import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
+
+const PENDING_QUESTIONS_MAX = 64;
+
+/** Normalize an option label to a slash command: "Approve" → "/approve" */
+function optionToCommand(option: string): string {
+  return '/' + option.toLowerCase().replace(/\s+/g, '-');
+}
 
 // ---------------------------------------------------------------------------
 // Signal CLI daemon management
@@ -550,6 +558,9 @@ export function createSignalAdapter(config: {
   let tcp: SignalTcpClient | null = null;
   let connected = false;
   const echoCache = new EchoCache();
+  // Pending questions: platformId → { questionId, options }
+  // User replies with /approve, /reject, etc. to answer
+  const pendingQuestions = new Map<string, { questionId: string; options: NormalizedOption[] }>();
   let setup: ChannelSetup | null = null;
 
   // -- inbound handling --
@@ -630,6 +641,24 @@ export function createSignalAdapter(config: {
     const isGroup = Boolean(groupId);
 
     const platformId = isGroup ? `group:${groupId}` : sender;
+
+    // Check if this reply answers a pending question via slash command
+    const pending = pendingQuestions.get(platformId);
+    if (pending && text.startsWith('/')) {
+      const cmd = text.trim().toLowerCase();
+      const matched = pending.options.find((o) => optionToCommand(o.label) === cmd);
+      if (matched) {
+        setup.onAction(pending.questionId, matched.value, sender);
+        pendingQuestions.delete(platformId);
+        await sendText(platformId, `${matched.selectedLabel} by ${senderName}`);
+        log.info('Signal: question answered', {
+          questionId: pending.questionId,
+          value: matched.value,
+          voterName: senderName,
+        });
+        return;
+      }
+    }
 
     if (text && echoCache.isEcho(platformId, text)) {
       log.debug('Signal: skipping echo', { platformId });
@@ -940,6 +969,34 @@ export function createSignalAdapter(config: {
 
     async deliver(platformId: string, _threadId: string | null, message: OutboundMessage): Promise<string | undefined> {
       const content = message.content as Record<string, unknown> | string | undefined;
+
+      // Ask question → text with slash command replies
+      if (
+        content &&
+        typeof content === 'object' &&
+        content.type === 'ask_question' &&
+        content.questionId &&
+        content.options
+      ) {
+        const questionId = content.questionId as string;
+        const title = content.title as string;
+        const question = content.question as string | undefined;
+        if (!title) {
+          log.error('Signal: ask_question missing required title — skipping delivery', { questionId });
+          return undefined;
+        }
+        const options: NormalizedOption[] = normalizeOptions(content.options as never);
+        const optionLines = options.map((o) => `  ${optionToCommand(o.label)}`).join('\n');
+        const text = `*${title}*\n\n${question ?? ''}\n\nReply with:\n${optionLines}`;
+        await sendText(platformId, text);
+        pendingQuestions.set(platformId, { questionId, options });
+        if (pendingQuestions.size > PENDING_QUESTIONS_MAX) {
+          const oldest = pendingQuestions.keys().next().value!;
+          pendingQuestions.delete(oldest);
+        }
+        return undefined;
+      }
+
       let text: string | null = null;
       if (typeof content === 'string') {
         text = content;
@@ -968,6 +1025,20 @@ export function createSignalAdapter(config: {
       } catch (err) {
         log.debug('Signal: typing indicator failed', { platformId, err });
       }
+    },
+
+    /**
+     * Without this, ensureUserDm (src/modules/permissions/user-dm.ts) treats
+     * Signal as direct-addressable and uses the bare user handle (UUID/number,
+     * no prefix) as the DM's platform_id. That mismatches the `signal:`-prefixed
+     * platformId every real inbound message from that same user carries
+     * (handleEnvelope's dataMessage path), so a cold-DM'd card (e.g. an
+     * unknown-sender approval) renders fine but its pendingQuestions entry is
+     * keyed under the wrong platformId — the user's slash-command reply can
+     * never match it.
+     */
+    async openDM(userHandle: string): Promise<string> {
+      return `signal:${userHandle}`;
     },
   };
 
